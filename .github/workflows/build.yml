@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - current
+      - testing
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: app.exe
+          - os: ubuntu-latest
+            asset: app
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Set release tag
+        shell: bash
+        run: sed -i "s|^release_tag = .*|release_tag = '${{ github.ref_name }}'|" app.py
+      - run: pyinstaller app.spec
+      - name: Checksum + version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          asset = "${{ matrix.asset }}"
+          data = open('dist/' + asset, 'rb').read()
+          open('dist/' + asset + '.sha256', 'w').write(hashlib.sha256(data).hexdigest())
+          open('dist/version.txt', 'w').write('deprecated')
+          PY
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ github.ref_name == 'testing' }}
+          make_latest: ${{ github.ref_name == 'current' }}
+          files: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+            dist/version.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
