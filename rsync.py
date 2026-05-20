@@ -12,6 +12,10 @@ import zipfile
 import zlib
 
 
+class Logger:
+    write = print
+
+
 class Info:
     def __init__(self):
         self.source = None
@@ -63,7 +67,7 @@ class Sync:
 
         for source in self.sources:
             if not os.path.exists(source):
-                print(source, 'not found')
+                Logger.write(source + ' not found')
                 return
 
             l_list |= self.__tree(source)
@@ -85,7 +89,12 @@ class Sync:
                     if l_info.size == r_info.size:
                         if not self.check_time or l_info.modified == r_info.modified:
                             if self.compare:
-                                comparable.append((path, l_info,))
+                                comparable.append(
+                                    (
+                                        path,
+                                        l_info,
+                                    )
+                                )
 
                         else:
                             l_modified = datetime.datetime.fromtimestamp(l_info.modified)
@@ -100,7 +109,7 @@ class Sync:
                     updated.add(path)
 
                     if self.verbose:
-                        print(*result)
+                        Logger.write(' '.join(str(x) for x in result))
 
             comparable = sorted(comparable, key=lambda x: x[1].size, reverse=True)
 
@@ -133,7 +142,7 @@ class Sync:
                         os.rmdir(self.destination + '/' + path)
 
                 if self.verbose:
-                    print('deleted:', path)
+                    Logger.write('deleted: ' + path)
 
         zip_files = {}
 
@@ -145,7 +154,7 @@ class Sync:
                     if not self.dry_run:
                         os.makedirs(self.destination + '/' + path)
 
-                    print('created:', path)
+                    Logger.write('created: ' + path)
 
             else:
                 if not self.dry_run:
@@ -177,10 +186,10 @@ class Sync:
 
                 if self.verbose:
                     if path in exists:
-                        print('updated:', path)
+                        Logger.write('updated: ' + path)
 
                     else:
-                        print('created:', path)
+                        Logger.write('created: ' + path)
 
         if not self.dry_run and self.restore_time:
             r_list = self.__tree(self.destination)
@@ -194,7 +203,7 @@ class Sync:
                         os.utime(self.destination + '/' + path, (l_info.modified, l_info.modified))
 
                         if self.verbose:
-                            print('restored modified time:', path)
+                            Logger.write('restored modified time: ' + path)
 
     def __compare(self, comparable):
         updated = set()
@@ -244,7 +253,7 @@ class Sync:
                 updated.add(path)
 
                 if self.verbose:
-                    print(*result)
+                    Logger.write(' '.join(str(x) for x in result))
 
         return updated
 
@@ -311,10 +320,12 @@ class Sync:
                 if short_path:
                     short_path += '/'
 
-                for dir_name in sorted(dir_names):
+                dir_names[:] = sorted(dir_names)
+                for dir_name in dir_names:
                     path = short_path + dir_name + '/'
 
                     if self.__skip(path):
+                        dir_names.remove(dir_name)
                         continue
 
                     info = Info()
@@ -363,7 +374,7 @@ class Sync:
             result = False
 
             for compiled_pattern in self.__compiled_exclude_patterns:
-                if compiled_pattern.findall(path):
+                if compiled_pattern.findall(path.rstrip('/')):
                     result = True
                     break
 

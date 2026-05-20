@@ -4,4 +4,4 @@ cd $(dirname $0)
 
 cd build
 
-pyinstaller --clean --onefile --specpath .. --console ../app.py
+pyinstaller --clean ../app.spec

@@ -1,2 +1,5 @@
 pyinstaller
 requests
+pyqt6
+pyqt6-webengine
+bbcode

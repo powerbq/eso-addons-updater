@@ -2,6 +2,6 @@
 
 cd build
 
-pyinstaller --clean --onefile --specpath .. --console ..\app.py
+pyinstaller --clean ..\app.spec
 
 pause
