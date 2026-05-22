@@ -1,31 +1,32 @@
 #!/usr/bin/python3
 
-import json
 import os
 import re
 import sys
 import threading
 
+import bbcode
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtCore import QObject
 from PyQt6.QtCore import QUrl
 
 from app import addon_exclusions
-from app import api_prefix
 from app import c
+from app import check_for_app_update
 from app import execute
 from app import favourites
+from app import fetch_addon_details
+from app import fetch_filelist
 from app import get_exclusions
+from app import get_library_conflicts
 from app import get_sync_on_launch
 from app import get_target_directory
-from app import get_version
+from app import parse_addon_list
 from app import save
 from app import set_exclusions
 from app import set_sync_on_launch
 from app import set_target_directory
-from app import set_version
-from func import download
 
 
 class Backend(QObject):
@@ -39,72 +40,29 @@ class Backend(QObject):
     appUpdateStatus = pyqtSignal(str)
     targetDirectoryChanged = pyqtSignal(str)
     exclusionsChanged = pyqtSignal(str)
+    conflictsLoading = pyqtSignal()
+    libraryConflictsReady = pyqtSignal('QVariantList')
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
     @pyqtSlot()
     def checkForUpdate(self):
-        def _run():
-            try:
-                file_path = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
-
-                old_version = get_version()
-
-                self.appUpdateStatus.emit('Checking for updates...')
-                new_version = (
-                    download('https://github.com/powerbq/eso-addons-updater/releases/download/current/version.txt')
-                    .decode('utf-8')
-                    .strip()
-                )
-
-                if old_version != new_version and file_path != __file__:
-                    self.appUpdateStatus.emit('Downloading update...')
-                    update = download(
-                        'https://github.com/powerbq/eso-addons-updater/releases/download/current/'
-                        + os.path.basename(file_path)
-                    )
-
-                    bak = file_path + '.bak'
-                    if os.path.exists(bak):
-                        os.unlink(bak)
-
-                    os.rename(file_path, bak)
-
-                    with open(file_path, 'wb') as f:
-                        f.write(update)
-
-                    set_version(new_version)
-                    save()
-
-                    self.appUpdateStatus.emit('Update complete. Please relaunch the application.')
-                else:
-                    self.appUpdateStatus.emit('')
-            except Exception:
-                self.appUpdateStatus.emit('')
-
-        threading.Thread(target=_run, daemon=True).start()
+        threading.Thread(
+            target=check_for_app_update,
+            args=(self.appUpdateStatus.emit,),
+            daemon=True,
+        ).start()
 
     @pyqtSlot()
     def fetchAddonList(self):
+        self.conflictsLoading.emit()
+
         def _run():
             try:
-                data = json.loads(download(api_prefix + '/filelist.json'))
-                simplified = [
-                    {
-                        'UID': obj['UID'],
-                        'UIName': obj['UIName'],
-                        'UIAuthorName': obj.get('UIAuthorName') or '',
-                        'UIVersion': obj.get('UIVersion') or '',
-                        'UIFileInfoURL': obj.get('UIFileInfoURL') or '',
-                        'UIDownloadTotal': int(obj.get('UIDownloadTotal') or 0),
-                        'UIDownloadMonthly': int(obj.get('UIDownloadMonthly') or 0),
-                        'UIFavoriteTotal': int(obj.get('UIFavoriteTotal') or 0),
-                        'UIDate': int(obj.get('UIDate') or 0),
-                    }
-                    for obj in data
-                ]
-                self.addonListReady.emit(simplified)
+                filelist = fetch_filelist()
+                self.addonListReady.emit(parse_addon_list(filelist))
+                self.libraryConflictsReady.emit(get_library_conflicts(filelist))
             except Exception as e:
                 self.logMessage.emit('Error fetching addon list: %s' % e)
 
@@ -114,10 +72,7 @@ class Backend(QObject):
     def fetchAddonDetails(self, uid):
         def _run():
             try:
-                import bbcode
-
-                data = json.loads(download(api_prefix + '/filedetails/' + uid + '.json'))
-                obj = data[0]
+                obj = fetch_addon_details(uid)
 
                 parser = bbcode.Parser(escape_html=False, drop_unrecognized=True)
 
@@ -211,10 +166,14 @@ class Backend(QObject):
     def runUpdate(self):
         self.logCleared.emit()
         self.updateStarted.emit()
+        self.conflictsLoading.emit()
 
         def _run():
             try:
-                execute(log_callback=self.logMessage.emit)
+                filelist = fetch_filelist()
+                self.addonListReady.emit(parse_addon_list(filelist))
+                execute(log_callback=self.logMessage.emit, filelist=filelist)
+                self.libraryConflictsReady.emit(get_library_conflicts(filelist))
             except Exception as e:
                 self.logMessage.emit('Update failed: %s' % e)
             finally:
@@ -253,3 +212,8 @@ class Backend(QObject):
         for uid, name in c['AddOns'].items():
             result.append({'uid': uid, 'name': name if name else uid})
         return result
+
+    @pyqtSlot(str, str)
+    def setSelectedLibrary(self, directory, uid):
+        c['SelectedLibraries'][directory] = uid
+        save()

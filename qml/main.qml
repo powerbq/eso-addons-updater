@@ -39,24 +39,33 @@ ApplicationWindow {
                 id: tabBar
                 anchors.fill: parent
                 contentHeight: 40
-                currentIndex: 1
 
                 TabButton {
+                    id: tabCatalogue
                     text: "Catalogue"
                     font.pixelSize: Theme.fontLg
                     implicitWidth: 140
                 }
                 TabButton {
+                    id: tabInstalled
                     text: "Installed"
                     font.pixelSize: Theme.fontLg
                     implicitWidth: 140
                 }
                 TabButton {
+                    id: tabLibraries
+                    text: "Libraries"
+                    font.pixelSize: Theme.fontLg
+                    implicitWidth: 140
+                }
+                TabButton {
+                    id: tabExclusions
                     text: "Exclusions"
                     font.pixelSize: Theme.fontLg
                     implicitWidth: 140
                 }
                 TabButton {
+                    id: tabLog
                     text: "Log"
                     font.pixelSize: Theme.fontLg
                     implicitWidth: 140
@@ -71,6 +80,7 @@ ApplicationWindow {
 
             AddonsTab {}
             InstalledTab {}
+            LibrariesTab { id: librariesTab }
             ExclusionsTab {}
             LogTab {}
         }
@@ -132,27 +142,26 @@ ApplicationWindow {
                     onCheckedChanged: if (backend) backend.setSyncOnLaunch(checked)
                 }
 
-                Text {
-                    text: "Syncing..."
-                    font.pixelSize: Theme.fontBase
-                    color: Theme.textSecondary
-                    visible: syncIndicator.running
-                }
-
                 BusyIndicator {
-                    id: syncIndicator
-                    running: false
-                    visible: running
+                    running: anyBusy
+                    visible: anyBusy
                     Layout.preferredWidth: 28
                     Layout.preferredHeight: 28
                 }
 
                 Button {
-                    text: "Sync"
-                    visible: !syncIndicator.running
+                    text: "Refresh List"
                     implicitHeight: Theme.buttonHeight
+                    visible: !anyBusy
+                    onClicked: { listLoading = true; backend.fetchAddonList() }
+                }
+
+                Button {
+                    text: "Sync"
+                    implicitHeight: Theme.buttonHeight
+                    visible: !anyBusy
                     Layout.leftMargin: 4
-                    onClicked: { tabBar.currentIndex = 3; backend.fetchAddonList(); backend.runUpdate() }
+                    onClicked: { goTo(tabLog); backend.runUpdate() }
                 }
             }
         }
@@ -194,22 +203,39 @@ ApplicationWindow {
 
     }
 
+    property bool listLoading: false
+    property bool syncRunning: false
+    property bool anyBusy: syncRunning || listLoading
+
     Connections {
         target: backend
-        function onUpdateStarted()  { syncIndicator.running = true }
-        function onUpdateFinished() { syncIndicator.running = false; ttcClientVisible = backend.hasTtcClient() }
+        function onUpdateStarted()           { syncRunning = true }
+        function onUpdateFinished()          { syncRunning = false; ttcClientVisible = backend.hasTtcClient() }
+        function onLibraryConflictsReady()   { listLoading = false }
         function onTargetDirectoryChanged(path) { targetDirField.text = path }
         function onAppUpdateStatus(msg) {
             updateOverlay.status = msg
-            if (msg === "" && backend.getSyncOnLaunch()) {
-                tabBar.currentIndex = 3
-                backend.fetchAddonList()
-                backend.runUpdate()
+            if (msg === "") {
+                if (backend.getSyncOnLaunch()) {
+                    goTo(tabLog)
+                    backend.runUpdate()
+                } else {
+                    listLoading = true
+                    backend.fetchAddonList()
+                }
             }
         }
     }
 
     property bool ttcClientVisible: backend ? backend.hasTtcClient() : false
 
-    Component.onCompleted: backend.checkForUpdate()
+    function goTo(tab) {
+        for (var i = 0; i < tabBar.count; i++)
+            if (tabBar.itemAt(i) === tab) { tabBar.currentIndex = i; return }
+    }
+
+    Component.onCompleted: {
+        goTo(tabInstalled)
+        backend.checkForUpdate()
+    }
 }

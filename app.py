@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import zipfile
 
 from func import download
@@ -95,17 +96,25 @@ def dependencies(path):
                         if directory not in satisfied:
                             satisfied.add(directory)
 
-                            if len(candidates[directory]) < 2:
-                                process(candidates[directory][0])
+                            uids = candidates[directory]
+                            if len(uids) < 2:
+                                process(uids[0])
 
                             else:
-                                if (
-                                    directory not in c['SelectedLibraries']
-                                    or c['SelectedLibraries'][directory] not in candidates
-                                ):
-                                    c['SelectedLibraries'][directory] = candidates[directory][0]
-
-                                process(c['SelectedLibraries'][directory])
+                                installed_candidates = [uid for uid in uids if uid in addons]
+                                if len(installed_candidates) == 1:
+                                    process(installed_candidates[0])
+                                elif len(installed_candidates) >= 2:
+                                    selected = c['SelectedLibraries'].get(directory)
+                                    process(selected if selected in installed_candidates else installed_candidates[0])
+                                else:
+                                    if (
+                                        directory not in c['SelectedLibraries']
+                                        or c['SelectedLibraries'][directory] not in uids
+                                    ):
+                                        best = min(uids, key=lambda u: uid_dirs.get(u, 0))
+                                        c['SelectedLibraries'][directory] = best
+                                    process(c['SelectedLibraries'][directory])
 
                         continue
 
@@ -151,9 +160,61 @@ def process(uid):
     dependencies(path)
 
 
-def run():
-    obj_list = json.loads(download(api_prefix + '/filelist.json'))
-    for obj in obj_list:
+def fetch_filelist():
+    return json.loads(download(api_prefix + '/filelist.json'))
+
+
+def fetch_addon_details(uid):
+    return json.loads(download(api_prefix + '/filedetails/' + uid + '.json'))[0]
+
+
+def parse_addon_list(filelist):
+    return [
+        {
+            'uid': obj['UID'],
+            'name': obj['UIName'],
+            'author': obj.get('UIAuthorName') or '',
+            'version': obj.get('UIVersion') or '',
+            'url': obj.get('UIFileInfoURL') or '',
+            'downloads': int(obj.get('UIDownloadTotal') or 0),
+            'monthlyDownloads': int(obj.get('UIDownloadMonthly') or 0),
+            'favorites': int(obj.get('UIFavoriteTotal') or 0),
+            'date': int(obj.get('UIDate') or 0),
+        }
+        for obj in filelist
+    ]
+
+
+def get_library_conflicts(filelist):
+    names = {}
+    local_candidates = {}
+    for obj in filelist:
+        uid = obj['UID']
+        names[uid] = obj['UIName']
+        for directory in obj.get('UIDir') or []:
+            local_candidates.setdefault(directory, []).append(uid)
+
+    conflicts = []
+    for directory, current_uid in sorted(c['SelectedLibraries'].items()):
+        uids = local_candidates.get(directory, [])
+        if len(uids) < 2:
+            continue
+        if current_uid not in uids:
+            current_uid = uids[0]
+        conflicts.append(
+            {
+                'dir': directory,
+                'addons': [{'uid': uid, 'name': names.get(uid, uid)} for uid in uids],
+                'selected': current_uid,
+            }
+        )
+    return conflicts
+
+
+def run(filelist=None):
+    if filelist is None:
+        filelist = fetch_filelist()
+    for obj in filelist:
         uid = obj['UID']
         name = obj['UIName']
         version = obj['UIVersion']
@@ -162,11 +223,10 @@ def run():
         database[uid].name = name
         database[uid].version = version
 
-        for directory in obj['UIDir']:
-            if directory not in candidates:
-                candidates[directory] = []
-
-            candidates[directory].append(uid)
+        dirs = obj.get('UIDir') or []
+        uid_dirs[uid] = len(dirs)
+        for directory in dirs:
+            candidates.setdefault(directory, []).append(uid)
 
     for uid in addons.keys():
         if uid in database:
@@ -246,7 +306,9 @@ def cleanup():
         elif section == 'SelectedLibraries':
             for option in list(c[section].keys()):
                 value = c[section][option]
-                if value not in database or len(candidates[option]) < 2:
+                uids = candidates.get(option, [])
+                installed_candidates = [uid for uid in uids if uid in addons]
+                if value not in database or len(uids) < 2 or len(installed_candidates) == 1 or option not in satisfied:
                     c.remove_option(section, option)
 
         else:
@@ -264,7 +326,7 @@ def save():
         c.write(f)
 
 
-def execute(log_callback=None):
+def execute(log_callback=None, filelist=None):
     Logger.write = log_callback or print
     RsyncLogger.write = Logger.write
 
@@ -275,17 +337,56 @@ def execute(log_callback=None):
 
     database.clear()
     candidates.clear()
+    uid_dirs.clear()
 
     satisfied.clear()
     unsatisfied.clear()
     sources.clear()
 
-    run()
+    run(filelist)
     cleanup()
     save()
 
     Logger.write = print
     RsyncLogger.write = print
+
+
+def check_for_app_update(status_callback):
+    try:
+        file_path = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)
+
+        old_version = get_version()
+
+        status_callback('Checking for updates...')
+        new_version = (
+            download('https://github.com/powerbq/eso-addons-updater/releases/download/current/version.txt')
+            .decode('utf-8')
+            .strip()
+        )
+
+        if old_version != new_version and file_path != __file__:
+            status_callback('Downloading update...')
+            update = download(
+                'https://github.com/powerbq/eso-addons-updater/releases/download/current/' + os.path.basename(file_path)
+            )
+
+            bak = file_path + '.bak'
+            if os.path.exists(bak):
+                os.unlink(bak)
+
+            os.rename(file_path, bak)
+
+            with open(file_path, 'wb') as f:
+                f.write(update)
+
+            set_version(new_version)
+            save()
+
+            status_callback('Update complete. Please relaunch the application.')
+        else:
+            status_callback('')
+    except Exception:
+        status_callback('')
 
 
 api_prefix = 'https://api.mmoui.com/v3/game/ESO'
@@ -337,6 +438,7 @@ favourites = c['Favourites']
 
 database = {}
 candidates = {}
+uid_dirs = {}
 
 satisfied = set()
 unsatisfied = set()
