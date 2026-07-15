@@ -16,9 +16,14 @@ jobs:
       matrix:
         include:
           - os: windows-latest
+            binary: app.exe
             asset: app.exe
           - os: ubuntu-latest
+            binary: app
             asset: app
+          - os: macos-14
+            binary: app
+            asset: app-macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -39,9 +44,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.asset }}" "dist/${{ matrix.asset }}"
+          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
           cd dist
-          sha256sum "${{ matrix.asset }}" | cut -d' ' -f1 > "${{ matrix.asset }}.sha256"
+          openssl dgst -sha256 -r "${{ matrix.asset }}" | cut -d' ' -f1 > "${{ matrix.asset }}.sha256"
           printf deprecated > version.txt
       - uses: softprops/action-gh-release@v2
         with:
@@ -52,5 +57,40 @@ jobs:
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
             dist/version.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dmg:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download seed updater from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" --pattern app-macos --dir .
+      - name: Build launcher .app + DMG
+        run: |
+          APP="build/ESO Addons Updater.app"
+          mkdir -p "$APP/Contents/MacOS"
+          cp app-macos "$APP/Contents/MacOS/app-macos"
+          cp macos/launcher.sh "$APP/Contents/MacOS/launcher"
+          cp macos/Info.plist "$APP/Contents/Info.plist"
+          chmod +x "$APP/Contents/MacOS/app-macos" "$APP/Contents/MacOS/launcher"
+          mkdir -p dist
+          hdiutil create -volname "ESO Addons Updater" \
+            -srcfolder build -ov -format UDZO dist/app-macos.dmg
+          cd dist
+          openssl dgst -sha256 -r app-macos.dmg | cut -d' ' -f1 > app-macos.dmg.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ github.ref_name == 'testing' }}
+          make_latest: ${{ github.ref_name == 'current' }}
+          files: |
+            dist/app-macos.dmg
+            dist/app-macos.dmg.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

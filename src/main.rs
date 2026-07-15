@@ -35,12 +35,19 @@ const MANAGER_EXE: &str = "app.exe";
 #[cfg(windows)]
 const MANAGER_ASSET: &str = "eso-addons-manager-windows-amd64.zip";
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const UPDATER_ASSET: &str = "app";
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const MANAGER_EXE: &str = "app";
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 const MANAGER_ASSET: &str = "eso-addons-manager-linux-amd64.zip";
+
+#[cfg(target_os = "macos")]
+const UPDATER_ASSET: &str = "app-macos";
+#[cfg(target_os = "macos")]
+const MANAGER_EXE: &str = "app.app/Contents/MacOS/app";
+#[cfg(target_os = "macos")]
+const MANAGER_ASSET: &str = "eso-addons-manager-macos-arm64.zip";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -219,6 +226,18 @@ fn extract_zip(body: &[u8], staging: &Path, remote: &Sha256Digest) -> Result<()>
         }
         if let Some(parent) = outpath.parent() {
             fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            if let Some(mode) = file.unix_mode() {
+                if mode & 0o170000 == 0o120000 {
+                    let mut target = String::new();
+                    file.read_to_string(&mut target)?;
+                    let _ = fs::remove_file(&outpath);
+                    std::os::unix::fs::symlink(target, &outpath)?;
+                    continue;
+                }
+            }
         }
         let mut out = File::create(&outpath)?;
         io::copy(&mut file, &mut out)?;
