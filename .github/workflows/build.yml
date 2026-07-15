@@ -22,24 +22,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install -r requirements.txt
-      - name: Set release tag
-        shell: bash
-        run: sed -i "s|^release_tag = .*|release_tag = '${{ github.ref_name }}'|" app.py
-      - run: pyinstaller app.spec
-      - name: Checksum + version
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install FLTK build deps (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libx11-dev libxext-dev libxft-dev libxinerama-dev \
+            libxcursor-dev libxrender-dev libxfixes-dev libpango1.0-dev \
+            libgl1-mesa-dev libglu1-mesa-dev
+      - name: Build
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: cargo build --release
+      - name: Stage asset + checksum
         shell: bash
         run: |
-          python - <<'PY'
-          import hashlib
-          asset = "${{ matrix.asset }}"
-          data = open('dist/' + asset, 'rb').read()
-          open('dist/' + asset + '.sha256', 'w').write(hashlib.sha256(data).hexdigest())
-          open('dist/version.txt', 'w').write('deprecated')
-          PY
+          mkdir -p dist
+          cp "target/release/${{ matrix.asset }}" "dist/${{ matrix.asset }}"
+          cd dist
+          sha256sum "${{ matrix.asset }}" | cut -d' ' -f1 > "${{ matrix.asset }}.sha256"
+          printf deprecated > version.txt
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
