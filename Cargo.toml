@@ -2,6 +2,9 @@
 name = "eso-addons-updater"
 version = "0.1.0"
 edition = "2021"
+authors = ["powerbq"]
+license = "MIT"
+description = "Updater and launcher for ESO Addons Manager"
 
 [[bin]]
 name = "app"

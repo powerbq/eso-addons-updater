@@ -1,5 +1,8 @@
 #![windows_subsystem = "windows"]
 
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 powerbq
+
 use std::fmt;
 use std::fs;
 use std::fs::File;
