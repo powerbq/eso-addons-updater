@@ -669,6 +669,23 @@ SmartScreen, найімовірніше, заблокує запуск і пов
 
 </details>
 
+## Usage
+
+This repository contains the **updater** only. The manager's codebase and the
+runtime assets the updater downloads live in
+[powerbq/eso-addons-manager](https://github.com/powerbq/eso-addons-manager).
+
+## Build
+
+Build the updater with Rust and Cargo:
+
+```bash
+./build.sh   # Linux / macOS
+build.cmd    # Windows
+```
+
+This runs `cargo build --release`; the binary is written to `target/release/`.
+
 ## License
 
 Released under the [MIT License](LICENSE). Copyright (c) 2026 powerbq.
