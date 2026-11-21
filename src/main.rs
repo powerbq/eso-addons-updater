@@ -52,6 +52,10 @@ const MANAGER_EXE: &str = "app.app/Contents/MacOS/app";
 #[cfg(target_os = "macos")]
 const MANAGER_ASSET: &str = "eso-addons-manager-macos-arm64.zip";
 
+const VERSION_FILE: &str = "version.txt";
+const SUMS_FILE: &str = "SHA256SUMS";
+const UPDATER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -122,13 +126,20 @@ fn manager_url() -> String {
     format!("{MANAGER_REPO}/{RELEASE_TAG}/{MANAGER_ASSET}")
 }
 
-fn to_hex(bytes: &[u8]) -> String {
-    use fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+fn updater_version_url() -> String {
+    format!("{UPDATER_REPO}/{RELEASE_TAG}/{VERSION_FILE}")
+}
+
+fn updater_sums_url() -> String {
+    format!("{UPDATER_REPO}/{RELEASE_TAG}/{SUMS_FILE}")
+}
+
+fn manager_version_url() -> String {
+    format!("{MANAGER_REPO}/{RELEASE_TAG}/{VERSION_FILE}")
+}
+
+fn manager_sums_url() -> String {
+    format!("{MANAGER_REPO}/{RELEASE_TAG}/{SUMS_FILE}")
 }
 
 fn parse_sha256(text: &str) -> Option<Sha256Digest> {
@@ -137,7 +148,8 @@ fn parse_sha256(text: &str) -> Option<Sha256Digest> {
         return None;
     }
     let mut digest = [0u8; 32];
-    for (byte, pair) in digest.iter_mut().zip(token.as_bytes().chunks_exact(2)) {
+    let (pairs, _) = token.as_bytes().as_chunks::<2>();
+    for (byte, pair) in digest.iter_mut().zip(pairs) {
         let pair = std::str::from_utf8(pair).ok()?;
         *byte = u8::from_str_radix(pair, 16).ok()?;
     }
@@ -148,16 +160,18 @@ fn sha256(data: &[u8]) -> Sha256Digest {
     Sha256::digest(data).into()
 }
 
-fn sha256_file(path: &Path) -> io::Result<Sha256Digest> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)?;
-    Ok(hasher.finalize().into())
+fn remote_text(agent: &ureq::Agent, url: &str) -> Result<String> {
+    Ok(agent.get(url).call()?.into_string()?)
 }
 
-fn remote_sha256(agent: &ureq::Agent, url: &str) -> Result<Sha256Digest> {
-    let body = agent.get(&format!("{url}.sha256")).call()?.into_string()?;
-    parse_sha256(&body).ok_or(Error::Msg("invalid remote checksum"))
+fn sha_from_sums(sums: &str, asset: &str) -> Option<Sha256Digest> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hex = parts.next()?;
+        let name = parts.next()?;
+        let name = name.strip_prefix('*').unwrap_or(name);
+        (name == asset).then(|| parse_sha256(hex)).flatten()
+    })
 }
 
 fn download(agent: &ureq::Agent, url: &str, s: &app::Sender<Msg>) -> Result<Vec<u8>> {
@@ -189,17 +203,23 @@ fn download(agent: &ureq::Agent, url: &str, s: &app::Sender<Msg>) -> Result<Vec<
 }
 
 fn update_self(updater_path: &Path, agent: &ureq::Agent, s: &app::Sender<Msg>) -> Result<bool> {
-    let url = updater_url();
-    let remote = remote_sha256(agent, &url)?;
-    if sha256_file(updater_path)? == remote {
+    let remote_version = remote_text(agent, &updater_version_url())?;
+    let remote_version = remote_version.trim();
+    if remote_version.is_empty() {
+        return Err(Error::Msg("empty remote updater version"));
+    }
+    if remote_version == UPDATER_VERSION {
         return Ok(false);
     }
 
+    let sums = remote_text(agent, &updater_sums_url())?;
+    let remote =
+        sha_from_sums(&sums, UPDATER_ASSET).ok_or(Error::Msg("updater checksum not found"))?;
+
     s.send(Msg::Status("Updating updater...".into()));
-    let body = download(agent, &url, s)?;
+    let body = download(agent, &updater_url(), s)?;
     if sha256(&body) != remote {
-        s.send(Msg::Status("Updater checksum mismatch, skipping.".into()));
-        return Ok(false);
+        return Err(Error::Msg("updater checksum mismatch"));
     }
 
     let bak = with_suffix(updater_path, ".bak");
@@ -214,7 +234,7 @@ fn update_self(updater_path: &Path, agent: &ureq::Agent, s: &app::Sender<Msg>) -
     Ok(true)
 }
 
-fn extract_zip(body: &[u8], staging: &Path, remote: &Sha256Digest) -> Result<()> {
+fn extract_zip(body: &[u8], staging: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(Cursor::new(body))?;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
@@ -253,28 +273,34 @@ fn extract_zip(body: &[u8], staging: &Path, remote: &Sha256Digest) -> Result<()>
         }
     }
 
-    let sha_path = staging.join(format!("{MANAGER_ASSET}.sha256"));
-    fs::write(sha_path, to_hex(remote))?;
     Ok(())
 }
 
 fn update_manager(manager_dir: &Path, agent: &ureq::Agent, s: &app::Sender<Msg>) -> Result<()> {
-    let url = manager_url();
-    let remote = remote_sha256(agent, &url)?;
+    let remote_version = remote_text(agent, &manager_version_url())?;
+    let remote_version = remote_version.trim();
+    if remote_version.is_empty() {
+        return Err(Error::Msg("empty remote manager version"));
+    }
 
-    let sha_path = manager_dir.join(format!("{MANAGER_ASSET}.sha256"));
-    let local = fs::read_to_string(&sha_path)
-        .ok()
-        .and_then(|v| parse_sha256(&v));
-    if local == Some(remote) && manager_dir.is_dir() {
+    let marker = manager_dir.join(VERSION_FILE);
+    let up_to_date = fs::read_to_string(&marker)
+        .as_deref()
+        .map(str::trim)
+        .map(|local| local == remote_version)
+        .unwrap_or(false);
+    if up_to_date && manager_dir.join(MANAGER_EXE).is_file() {
         return Ok(());
     }
 
+    let sums = remote_text(agent, &manager_sums_url())?;
+    let remote =
+        sha_from_sums(&sums, MANAGER_ASSET).ok_or(Error::Msg("manager checksum not found"))?;
+
     s.send(Msg::Status("Downloading manager...".into()));
-    let body = download(agent, &url, s)?;
+    let body = download(agent, &manager_url(), s)?;
     if sha256(&body) != remote {
-        s.send(Msg::Status("Manager checksum mismatch, skipping.".into()));
-        return Ok(());
+        return Err(Error::Msg("manager checksum mismatch"));
     }
 
     s.send(Msg::Status("Extracting manager...".into()));
@@ -282,10 +308,11 @@ fn update_manager(manager_dir: &Path, agent: &ureq::Agent, s: &app::Sender<Msg>)
         fs::remove_dir_all(manager_dir)?;
     }
     fs::create_dir_all(manager_dir)?;
-    if let Err(e) = extract_zip(&body, manager_dir, &remote) {
+    if let Err(e) = extract_zip(&body, manager_dir) {
         let _ = fs::remove_dir_all(manager_dir);
         return Err(e);
     }
+    fs::write(&marker, remote_version)?;
 
     s.send(Msg::Status("Manager updated.".into()));
     Ok(())

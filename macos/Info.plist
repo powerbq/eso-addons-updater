@@ -4,6 +4,8 @@
 <dict>
   <key>CFBundleName</key><string>ESO Addons Updater</string>
   <key>CFBundleDisplayName</key><string>ESO Addons Updater</string>
+  <key>CFBundleIdentifier</key><string>io.github.powerbq.eso-addons-updater</string>
+  <key>CFBundleIconFile</key><string>eso-addons-updater</string>
   <key>CFBundleExecutable</key><string>launcher</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1.0</string>

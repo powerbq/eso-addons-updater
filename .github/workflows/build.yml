@@ -10,26 +10,32 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            binary: app.exe
-            asset: app.exe
-          - os: ubuntu-latest
-            binary: app
-            asset: app
-          - os: macos-14
-            binary: app
-            asset: app-macos
-    runs-on: ${{ matrix.os }}
+  # --- 1. Build (one job per platform, binary shared via artifact) ---
+  build-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install FLTK build deps (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Build
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: cargo build --release
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/app.exe dist/app.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-app.exe
+          path: dist/app.exe
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install FLTK build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -40,57 +46,97 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: cargo build --release
-      - name: Stage asset + checksum
-        shell: bash
+      - name: Stage asset
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
-          cd dist
-          openssl dgst -sha256 -r "${{ matrix.asset }}" | cut -d' ' -f1 > "${{ matrix.asset }}.sha256"
-          printf deprecated > version.txt
-      - uses: softprops/action-gh-release@v2
+          cp target/release/app dist/app
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          prerelease: ${{ github.ref_name == 'testing' }}
-          make_latest: ${{ github.ref_name == 'current' }}
-          files: |
-            dist/${{ matrix.asset }}
-            dist/${{ matrix.asset }}.sha256
-            dist/version.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: bin-app
+          path: dist/app
 
-  dmg:
-    needs: build
-    runs-on: macos-14
+  build-macos:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download seed updater from release
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: cargo build --release
+      - name: Stage asset
         run: |
-          gh release download "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" --pattern app-macos --dir .
+          mkdir -p dist
+          cp target/release/app dist/app-macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-app-macos
+          path: dist/app-macos
+
+  # --- 2. Package the macOS launcher .app into a DMG (needs only the macOS build) ---
+  dmg:
+    needs: build-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-app-macos
+          path: .
       - name: Build launcher .app + DMG
         run: |
+          [ "$(head -c4 icons/eso-addons-updater.icns)" = icns ] || { echo "icons/eso-addons-updater.icns is not a valid icns — regenerate with ./icons.sh" >&2; exit 1; }
           APP="build/ESO Addons Updater.app"
-          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp app-macos "$APP/Contents/MacOS/app-macos"
           cp macos/launcher.sh "$APP/Contents/MacOS/launcher"
           cp macos/Info.plist "$APP/Contents/Info.plist"
+          cp icons/eso-addons-updater.icns "$APP/Contents/Resources/eso-addons-updater.icns"
           chmod +x "$APP/Contents/MacOS/app-macos" "$APP/Contents/MacOS/launcher"
           mkdir -p dist
           hdiutil create -volname "ESO Addons Updater" \
             -srcfolder build -ov -format UDZO dist/app-macos.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-dmg
+          path: dist/app-macos.dmg
+
+  # --- 3. Release (version.txt + combined SHA256SUMS + per-asset .sha256) ---
+  release:
+    needs: [build-windows, build-linux, build-macos, dmg]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: dist
+      - name: Version file and checksums
+        run: |
+          sed -nE 's/^version *= *"([^"]+)".*/\1/p' Cargo.toml | head -1 > dist/version.txt
           cd dist
-          openssl dgst -sha256 -r app-macos.dmg | cut -d' ' -f1 > app-macos.dmg.sha256
+          mapfile -t assets < <(find . -maxdepth 1 -type f ! -name 'version.txt' -printf '%P\n' | sort)
+          sha256sum "${assets[@]}" > SHA256SUMS
+          for f in "${assets[@]}"; do
+            printf '%s' "$(sha256sum "$f" | cut -d' ' -f1)" > "$f.sha256"
+          done
+      - name: Clear old release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release view "$tag" --json assets --jq '.assets[].name' \
+              | while IFS= read -r asset; do
+                  [ -n "$asset" ] && gh release delete-asset "$tag" "$asset" --yes
+                done
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: ${{ github.ref_name == 'testing' }}
           make_latest: ${{ github.ref_name == 'current' }}
-          files: |
-            dist/app-macos.dmg
-            dist/app-macos.dmg.sha256
+          files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
