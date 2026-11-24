@@ -29,7 +29,12 @@ const RELEASE_TAG: &str = match option_env!("RELEASE_TAG") {
 };
 
 const UPDATER_REPO: &str = "https://github.com/powerbq/eso-addons-updater/releases/download";
-const MANAGER_REPO: &str = "https://github.com/powerbq/eso-addons-manager/releases/download";
+const MANAGER_RELEASES: &str = "https://github.com/powerbq/eso-addons-manager/releases";
+const MANAGER_API: &str = "https://api.github.com/repos/powerbq/eso-addons-manager/releases";
+
+// The baked channel decides which manager the updater fetches: `testing` → the newest pre-release (via
+// the API), anything else → the stable `latest` release (via the redirect).
+const CHANNEL_TESTING: &str = "testing";
 
 #[cfg(windows)]
 const UPDATER_ASSET: &str = "app.exe";
@@ -55,6 +60,7 @@ const MANAGER_ASSET: &str = "eso-addons-manager-macos-arm64.zip";
 const VERSION_FILE: &str = "version.txt";
 const SUMS_FILE: &str = "SHA256SUMS";
 const UPDATER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const USER_AGENT: &str = concat!("eso-addons-updater/", env!("CARGO_PKG_VERSION"));
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -66,6 +72,7 @@ enum Error {
     Io(io::Error),
     Http(Box<ureq::Error>),
     Zip(zip::result::ZipError),
+    Json(serde_json::Error),
     Msg(&'static str),
 }
 
@@ -75,6 +82,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "{e}"),
             Error::Http(e) => write!(f, "{e}"),
             Error::Zip(e) => write!(f, "{e}"),
+            Error::Json(e) => write!(f, "{e}"),
             Error::Msg(m) => write!(f, "{m}"),
         }
     }
@@ -100,6 +108,33 @@ impl From<zip::result::ZipError> for Error {
     }
 }
 
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::Json(e)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Release {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+}
+
+// The newest release tag by SemVer among non-drafts (pre-releases included), so the testing channel is
+// never empty: with no pre-release it resolves to the stable latest. Tags keep their leading `v`.
+fn newest(releases: &[Release]) -> Option<&str> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            let version = semver::Version::parse(release.tag_name.strip_prefix('v')?).ok()?;
+            Some((version, release.tag_name.as_str()))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, tag)| tag)
+}
+
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone)]
@@ -115,15 +150,12 @@ fn http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(READ_TIMEOUT)
+        .user_agent(USER_AGENT) // GitHub's API 403s without a User-Agent; harmless on asset downloads
         .build()
 }
 
 fn updater_url() -> String {
     format!("{UPDATER_REPO}/{RELEASE_TAG}/{UPDATER_ASSET}")
-}
-
-fn manager_url() -> String {
-    format!("{MANAGER_REPO}/{RELEASE_TAG}/{MANAGER_ASSET}")
 }
 
 fn updater_version_url() -> String {
@@ -134,12 +166,40 @@ fn updater_sums_url() -> String {
     format!("{UPDATER_REPO}/{RELEASE_TAG}/{SUMS_FILE}")
 }
 
-fn manager_version_url() -> String {
-    format!("{MANAGER_REPO}/{RELEASE_TAG}/{VERSION_FILE}")
+// The manager release this updater's baked channel should install: the asset-download base plus the
+// version. `testing` takes the newest by SemVer (pre-releases included) from the releases API; any
+// other channel takes the stable `latest` (the newest non-pre-release). Both resolve a concrete tag
+// and download that tag's assets — no `version.txt` asset is read; the version comes from the tag.
+struct ManagerRelease {
+    base: String,
+    version: String,
 }
 
-fn manager_sums_url() -> String {
-    format!("{MANAGER_REPO}/{RELEASE_TAG}/{SUMS_FILE}")
+fn manager_release(agent: &ureq::Agent) -> Result<ManagerRelease> {
+    let tag = if RELEASE_TAG == CHANNEL_TESTING {
+        let body = remote_text(agent, MANAGER_API)?;
+        let releases: Vec<Release> = serde_json::from_str(&body)?;
+        newest(&releases)
+            .ok_or(Error::Msg("no manager release found"))?
+            .to_owned()
+    } else {
+        let body = remote_text(agent, &format!("{MANAGER_API}/latest"))?;
+        let release: Release = serde_json::from_str(&body)?;
+        release.tag_name
+    };
+    let version = tag.strip_prefix('v').unwrap_or(&tag).to_owned();
+    Ok(ManagerRelease {
+        base: format!("{MANAGER_RELEASES}/download/{tag}"),
+        version,
+    })
+}
+
+fn manager_asset_url(base: &str) -> String {
+    format!("{base}/{MANAGER_ASSET}")
+}
+
+fn manager_sums_url(base: &str) -> String {
+    format!("{base}/{SUMS_FILE}")
 }
 
 fn parse_sha256(text: &str) -> Option<Sha256Digest> {
@@ -277,8 +337,8 @@ fn extract_zip(body: &[u8], staging: &Path) -> Result<()> {
 }
 
 fn update_manager(manager_dir: &Path, agent: &ureq::Agent, s: &app::Sender<Msg>) -> Result<()> {
-    let remote_version = remote_text(agent, &manager_version_url())?;
-    let remote_version = remote_version.trim();
+    let release = manager_release(agent)?;
+    let remote_version = release.version.as_str();
     if remote_version.is_empty() {
         return Err(Error::Msg("empty remote manager version"));
     }
@@ -293,12 +353,12 @@ fn update_manager(manager_dir: &Path, agent: &ureq::Agent, s: &app::Sender<Msg>)
         return Ok(());
     }
 
-    let sums = remote_text(agent, &manager_sums_url())?;
+    let sums = remote_text(agent, &manager_sums_url(&release.base))?;
     let remote =
         sha_from_sums(&sums, MANAGER_ASSET).ok_or(Error::Msg("manager checksum not found"))?;
 
     s.send(Msg::Status("Downloading manager...".into()));
-    let body = download(agent, &manager_url(), s)?;
+    let body = download(agent, &manager_asset_url(&release.base), s)?;
     if sha256(&body) != remote {
         return Err(Error::Msg("manager checksum mismatch"));
     }
@@ -428,5 +488,53 @@ fn main() {
                 Msg::Quit => application.quit(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(tag: &str, draft: bool) -> Release {
+        Release {
+            tag_name: tag.to_owned(),
+            draft,
+        }
+    }
+
+    #[test]
+    fn newest_is_max_semver_among_non_drafts() {
+        let releases = [
+            release("v0.1.0-rc.2", false),
+            release("v0.1.0-rc.10", false),
+            release("v0.1.0", false),
+            release("v9.9.9", true), // draft: ignored even though highest
+        ];
+        assert_eq!(newest(&releases), Some("v0.1.0"));
+    }
+
+    #[test]
+    fn newest_prefers_newest_rc_when_no_final() {
+        let releases = [
+            release("v0.1.0-rc.1", false),
+            release("v0.1.0-rc.10", false),
+        ];
+        assert_eq!(newest(&releases), Some("v0.1.0-rc.10"));
+    }
+
+    #[test]
+    fn newest_is_none_without_valid_non_drafts() {
+        assert_eq!(newest(&[]), None);
+        assert_eq!(newest(&[release("nightly", false)]), None);
+        assert_eq!(newest(&[release("v1.0.0", true)]), None);
+    }
+
+    #[test]
+    fn release_deserialises_without_draft_field() {
+        let releases: Vec<Release> =
+            serde_json::from_str(r#"[{"tag_name":"v0.1.0","prerelease":false}]"#).unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].tag_name, "v0.1.0");
+        assert!(!releases[0].draft);
     }
 }
