@@ -388,6 +388,8 @@ fn launch(manager_dir: &Path, updater_dir: &Path) -> io::Result<()> {
     let exe = manager_dir.join(MANAGER_EXE);
     let mut cmd = Command::new(exe);
     cmd.current_dir(updater_dir);
+    // The updater has already applied the channel's update, so the manager's own in-app check is off.
+    cmd.arg("--no-update-check");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
